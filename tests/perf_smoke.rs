@@ -133,6 +133,7 @@ fn opts(jobs: usize) -> SyncOptions {
         rdma_helper: "parsync --internal-rdma-send".to_string(),
         strict_windows_metadata: false,
         exclude_patterns: vec![],
+        delete: false,
     }
 }
 
