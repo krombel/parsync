@@ -163,6 +163,10 @@ pub struct Cli {
     #[arg(long = "strict-windows-metadata", action = ArgAction::SetTrue)]
     pub strict_windows_metadata: bool,
 
+    /// Exclude paths (rsync-style patterns; repeatable)
+    #[arg(long = "exclude", value_name = "PATTERN")]
+    pub exclude: Vec<String>,
+
     /// SSH private key file
     #[arg(short = 'i', long = "identity-file")]
     pub identity_file: Option<std::path::PathBuf>,
@@ -236,5 +240,18 @@ mod tests {
         assert_eq!(cli.rdma, Some(RdmaMode::Require));
         assert_eq!(cli.rdma_bind.unwrap().to_string(), "10.10.0.12");
         assert_eq!(cli.rdma_min_size, Some(1_048_576));
+
+    #[test]
+    fn parses_exclude() {
+        let cli = Cli::parse_from([
+            "parsync",
+            "--exclude",
+            "*.o",
+            "--exclude",
+            "build/",
+            "user@h:/src",
+            "/dst",
+        ]);
+        assert_eq!(cli.exclude, ["*.o", "build/"]);
     }
 }

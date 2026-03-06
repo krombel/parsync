@@ -280,6 +280,7 @@ pub struct SshRemote {
     root_kind: EntryKind,
     root_basename: PathBuf,
     star_children_mode: bool,
+    exclude_patterns: Vec<String>,
     pool: Arc<ConnectionPool>,
 }
 
@@ -288,6 +289,7 @@ impl SshRemote {
         spec: RemoteSpec,
         pool_size: usize,
         identity_file_override: Option<PathBuf>,
+        exclude_patterns: Vec<String>,
     ) -> Result<Self> {
         let star_children_mode = spec.path_trailing_star;
         let target = resolve_connect_target(&spec, identity_file_override.as_ref())?;
@@ -311,6 +313,7 @@ impl SshRemote {
             root_kind,
             root_basename,
             star_children_mode,
+            exclude_patterns,
             pool,
         })
     }
@@ -403,6 +406,10 @@ impl SshRemote {
                     link_target,
                 };
 
+                if path_matches_rsync_exclude(&entry.relative_path, &self.exclude_patterns) {
+                    continue;
+                }
+
                 if recursive && kind == EntryKind::Dir {
                     stack.push((full_path.clone(), child_rel));
                 }
@@ -442,6 +449,7 @@ impl SshRemote {
             &self.root_path,
             recursive,
             self.star_children_mode,
+            &self.exclude_patterns,
             progress,
         )?;
 
@@ -1265,14 +1273,25 @@ impl Connection {
         root: &Path,
         recursive: bool,
         star_children_mode: bool,
+        exclude_patterns: &[String],
         progress: Option<&dyn Fn(usize)>,
     ) -> Result<Vec<RemoteEntry>> {
         let depth_expr = if recursive { "" } else { "-maxdepth 1" };
-        let cmd = format!(
-            "cd {} && find . {depth_expr} -mindepth 1 -printf '%y\\037%P\\037%s\\037%T@\\037%m\\037%U\\037%G\\037%l\\0'",
-            shell_quote(root)
-        );
+        let printf_fmt = "-printf '%y\\037%P\\037%s\\037%T@\\037%m\\037%U\\037%G\\037%l\\0'";
+        let cmd = if exclude_patterns.is_empty() {
+            format!(
+                "cd {} && find . {depth_expr} -mindepth 1 {printf_fmt}",
+                shell_quote(root)
+            )
+        } else {
+            let (prune_expr, exclude_expr) = build_find_exclude_exprs(exclude_patterns);
+            format!(
+                "cd {} && find . {depth_expr} -mindepth 1 {printf_fmt} \\( {prune_expr} \\) -o \\( ! \\( {exclude_expr} \\) \\)",
+                shell_quote(root)
+            )
+        };
 
+        eprintln!("[parsync][debug] find command: {cmd}");
         let mut channel = self.session.channel_session().context("open ssh channel")?;
         channel
             .exec(&cmd)
@@ -1545,12 +1564,19 @@ impl<'a> PooledConnection<'a> {
         root: &Path,
         recursive: bool,
         star_children_mode: bool,
+        exclude_patterns: &[String],
         progress: Option<&dyn Fn(usize)>,
     ) -> Result<Vec<RemoteEntry>> {
         self.conn
             .as_mut()
             .ok_or_else(|| anyhow!("missing pooled connection"))?
-            .stream_find_entries(root, recursive, star_children_mode, progress)
+            .stream_find_entries(
+                root,
+                recursive,
+                star_children_mode,
+                exclude_patterns,
+                progress,
+            )
     }
 }
 
@@ -1760,6 +1786,96 @@ fn entry_kind_from_perm(perm: u32) -> EntryKind {
         S_IFREG => EntryKind::File,
         _ => EntryKind::File,
     }
+}
+
+/// Build (prune_expr, exclude_expr) for find from rsync-style exclude patterns.
+/// Empty patterns are skipped. Prune: -path './DIR' -prune -o for each pattern ending with /.
+/// Exclude: -name 'PATTERN' for no-slash patterns, -path './P' -o -path './P/*' for path patterns.
+pub(crate) fn build_find_exclude_exprs(patterns: &[String]) -> (String, String) {
+    let patterns: Vec<&str> = patterns
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if patterns.is_empty() {
+        return ("-true".to_string(), "-false".to_string());
+    }
+    let mut prune_parts = Vec::new();
+    let mut exclude_parts = Vec::new();
+    for p in &patterns {
+        let trimmed = p.trim_start_matches('/');
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.ends_with('/') {
+            let dir = trimmed.trim_end_matches('/');
+            if dir.is_empty() {
+                continue;
+            }
+            let path_arg = format!("./{}", dir);
+            prune_parts.push(format!("-path {} -prune -o", shell_quote_word(&path_arg)));
+            exclude_parts.push(format!(
+                "-path {} -o -path {}",
+                shell_quote_word(&path_arg),
+                shell_quote_word(&format!("./{}/*", dir))
+            ));
+        } else if trimmed.contains('/') {
+            let path_arg = format!("./{}", trimmed);
+            exclude_parts.push(format!(
+                "-path {} -o -path {}",
+                shell_quote_word(&path_arg),
+                shell_quote_word(&format!("./{}/*", trimmed))
+            ));
+        } else {
+            exclude_parts.push(format!("-name {}", shell_quote_word(trimmed)));
+        }
+    }
+    let prune_expr = if prune_parts.is_empty() {
+        "-true".to_string()
+    } else {
+        format!("{} -true", prune_parts.join(" "))
+    };
+    let exclude_expr = exclude_parts.join(" -o ");
+    (prune_expr, exclude_expr)
+}
+
+/// Returns true if the relative path should be excluded by the given rsync-style patterns.
+pub(crate) fn path_matches_rsync_exclude(path: &Path, patterns: &[String]) -> bool {
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    let path_str = path_str.trim_start_matches('/');
+    for p in patterns {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let p = p.trim_start_matches('/');
+        if p.is_empty() {
+            continue;
+        }
+        if p.ends_with('/') {
+            let dir = p.trim_end_matches('/');
+            if path_str == dir
+                || path_str.starts_with(&format!("{}/", dir))
+                || path_str.ends_with(&format!("/{}", dir))
+                || path_str.contains(&format!("/{}/", dir))
+            {
+                return true;
+            }
+        } else if p.contains('/') {
+            if path_str == p || path_str.starts_with(&format!("{}/", p)) {
+                return true;
+            }
+        } else {
+            let basename = path
+                .file_name()
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if glob_match(p, &basename) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn shell_quote(path: &Path) -> String {
@@ -2216,9 +2332,12 @@ mod tests {
     use std::collections::HashSet;
     use tempfile::TempDir;
 
+    use std::path::Path;
+
     use super::{
-        glob_match, is_missing_remote_command, load_ssh_config_path, parse_macos_xattrs,
-        parse_source_spec, parse_ssh_config, parse_xattrs, LocalSourceSpec, RemoteSpec, SourceSpec,
+        build_find_exclude_exprs, glob_match, is_missing_remote_command, load_ssh_config_path,
+        parse_macos_xattrs, parse_source_spec, parse_ssh_config, parse_xattrs,
+        path_matches_rsync_exclude, LocalSourceSpec, RemoteSpec, SourceSpec,
     };
     #[cfg(unix)]
     use super::{parse_find_record, EntryKind};
@@ -2420,6 +2539,66 @@ mod tests {
         assert!(glob_match("ln*", "lnbox"));
         assert!(glob_match("l?box", "lnbox"));
         assert!(!glob_match("a*", "lnbox"));
+    }
+
+    #[test]
+    fn path_matches_rsync_exclude_trailing_slash() {
+        let patterns = vec!["build/".to_string()];
+        assert!(path_matches_rsync_exclude(Path::new("build"), &patterns));
+        assert!(path_matches_rsync_exclude(
+            Path::new("build/foo"),
+            &patterns
+        ));
+        assert!(path_matches_rsync_exclude(Path::new("a/build"), &patterns));
+        assert!(path_matches_rsync_exclude(
+            Path::new("a/build/x"),
+            &patterns
+        ));
+        assert!(!path_matches_rsync_exclude(Path::new("buildx"), &patterns));
+        assert!(!path_matches_rsync_exclude(
+            Path::new("a/buildx"),
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn path_matches_rsync_exclude_basename_glob() {
+        let patterns = vec!["*.o".to_string()];
+        assert!(path_matches_rsync_exclude(Path::new("a.o"), &patterns));
+        assert!(path_matches_rsync_exclude(Path::new("dir/b.o"), &patterns));
+        assert!(!path_matches_rsync_exclude(Path::new("a.c"), &patterns));
+    }
+
+    #[test]
+    fn path_matches_rsync_exclude_path_with_slash() {
+        let patterns = vec!["path/to/dir".to_string()];
+        assert!(path_matches_rsync_exclude(
+            Path::new("path/to/dir"),
+            &patterns
+        ));
+        assert!(path_matches_rsync_exclude(
+            Path::new("path/to/dir/file"),
+            &patterns
+        ));
+        assert!(!path_matches_rsync_exclude(Path::new("path/to"), &patterns));
+    }
+
+    #[test]
+    fn build_find_exclude_exprs_empty() {
+        let (prune, exclude) = build_find_exclude_exprs(&[]);
+        assert_eq!(prune, "-true");
+        assert_eq!(exclude, "-false");
+    }
+
+    #[test]
+    fn build_find_exclude_exprs_dir_and_name() {
+        let patterns = vec!["build/".to_string(), "*.o".to_string()];
+        let (prune, exclude) = build_find_exclude_exprs(&patterns);
+        assert!(prune.contains("-path"));
+        assert!(prune.contains("build"));
+        assert!(prune.contains("-prune"));
+        assert!(exclude.contains("build"));
+        assert!(exclude.contains("*.o"));
     }
 
     #[test]
